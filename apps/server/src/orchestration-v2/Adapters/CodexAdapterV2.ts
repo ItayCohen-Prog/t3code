@@ -1106,6 +1106,7 @@ function codexErrorInfoCode(value: unknown): string | null {
 }
 
 interface ActiveCodexTurnContext {
+  closedCommandItemIds?: ReadonlySet<string>;
   latestProviderFailure?: {
     readonly nativeMessage: string;
     readonly failure: OrchestrationV2ProviderFailure;
@@ -4610,14 +4611,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           });
         });
 
-        // Codex unloads an unsubscribed idle thread after shutting down its
-        // terminals, without completing each command item. The shared session
-        // stays alive, so its retained commands need their own terminal events.
+        // Unloading an idle thread kills its terminals without completing
+        // their command items, while the shared provider session stays alive.
         yield* client.handleServerNotification("thread/closed", (payload) =>
           Effect.gen(function* () {
             const completedAt = yield* DateTime.now;
             for (const context of (yield* Ref.get(settledTurns)).values()) {
               if (context.providerThread.nativeThreadRef?.nativeId !== payload.threadId) continue;
+              const commands = (yield* Ref.get(runningCommandItemsByTurn)).get(
+                context.nativeTurnId,
+              );
+              if (commands !== undefined) {
+                context.closedCommandItemIds = new Set(commands.keys());
+              }
               yield* terminalizeRunningCommandItems(
                 context,
                 context.nativeTurnId,
@@ -4805,6 +4811,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "commandExecution") {
+              // Other tools can retain the context after thread closure.
+              if (context.closedCommandItemIds?.has(payload.item.id)) return;
               const turnDrained = yield* clearRunningCommandItem(payload.turnId, payload.item.id);
               const artifacts = yield* buildCommandExecutionArtifacts(context, payload.item);
               yield* emitProviderEvent({
